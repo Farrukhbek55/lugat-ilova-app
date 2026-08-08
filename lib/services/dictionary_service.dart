@@ -32,9 +32,7 @@ class DictionaryService {
     final dbPath = join(docDir.path, 'topsoz.db');
     final dbFile = File(dbPath);
 
-    const int maxSize = 30 * 1024 * 1024;
-    final bool needsCopy = !dbFile.existsSync() ||
-        await dbFile.length() > maxSize;
+    final bool needsCopy = !dbFile.existsSync();
 
     if (needsCopy) {
       if (dbFile.existsSync()) await dbFile.delete();
