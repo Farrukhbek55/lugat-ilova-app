@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart';
 import 'package:path_provider/path_provider.dart';
@@ -20,35 +21,39 @@ class DictionaryService {
   final _progressController = StreamController<double>.broadcast();
   Stream<double> get progressStream => _progressController.stream;
 
-  // Keraksiz ta'rif shablonlari
-  static const _badPrefixes = [
-    'Cyrillic', 'Synonym', 'Alternative', 'plural', 'plural of',
-    'past tense', 'genitive', 'dative', 'accusative', 'locative',
-  ];
-
   Future<void> load() async {
     if (_db != null) return;
     final docDir = await getApplicationDocumentsDirectory();
     final dbPath = join(docDir.path, 'topsoz.db');
     final dbFile = File(dbPath);
 
-    final bool needsCopy = !dbFile.existsSync();
-
-    if (needsCopy) {
-      if (dbFile.existsSync()) await dbFile.delete();
-      _progressController.add(0.1);
+    if (!dbFile.existsSync()) {
+      // Birinchi marta: chunk-by-chunk yozish (tezroq va xotira tejamkor)
+      _progressController.add(0.05);
       final data = await rootBundle.load('assets/topsoz.db');
-      _progressController.add(0.5);
-      await File(dbPath).writeAsBytes(
-          data.buffer.asUint8List(), flush: true);
+      _progressController.add(0.2);
+
+      final bytes = data.buffer.asUint8List();
+      final file = dbFile.openSync(mode: FileMode.write);
+      const chunkSize = 256 * 1024; // 256KB bo'laklar
+      final total = bytes.length;
+
+      for (int i = 0; i < total; i += chunkSize) {
+        final end = (i + chunkSize).clamp(0, total);
+        file.writeFromSync(bytes, i, end);
+        // Progress: 0.2 dan 0.95 gacha
+        _progressController.add(0.2 + (end / total) * 0.75);
+      }
+      file.flushSync();
+      file.closeSync();
       _progressController.add(1.0);
     }
 
-    _db = await openDatabase(dbPath, readOnly: false);
+    _db = await openDatabase(dbPath, readOnly: true);
     try {
-      await _db!.execute('PRAGMA cache_size = 10000');
+      await _db!.execute('PRAGMA cache_size = 8000');
       await _db!.execute('PRAGMA temp_store = MEMORY');
-      await _db!.execute('PRAGMA mmap_size = 268435456');
+      await _db!.execute('PRAGMA mmap_size = 134217728');
     } catch (_) {}
 
     final res = await _db!.rawQuery('SELECT COUNT(*) as c FROM words');
@@ -63,114 +68,62 @@ class DictionaryService {
     List<Map<String, dynamic>> rows;
 
     if (uzToEn) {
+      // EN->UZ: so'z bo'yicha qidiruv (word ustunida indeks bor)
       rows = await _db!.rawQuery('''
-        SELECT MIN(w.id) as id, w.word, w.word_cyrillic,
+        SELECT w.id, w.word, w.word_cyrillic,
                w.part_of_speech, w.pronunciation,
-               MIN(CASE
-                 WHEN d.target_language='en'
-                   AND w.part_of_speech != ''
-                   AND d.definition NOT LIKE 'Cyrillic%'
-                   AND d.definition NOT LIKE 'Synonym%'
-                   AND d.definition NOT LIKE 'Alternative%'
-                   AND d.definition NOT LIKE 'plural%'
-                 THEN d.definition END) as def_en,
-               MIN(CASE WHEN d.target_language='ru'
-                   THEN d.definition END) as def_ru
+               d.definition as def_en
         FROM words w
-        LEFT JOIN definitions d ON d.word_id = w.id AND d.definition != ''
+        LEFT JOIN definitions d ON d.word_id = w.id
         WHERE w.word LIKE ?
-        GROUP BY w.word, w.part_of_speech
-        ORDER BY
-          CASE WHEN w.part_of_speech != '' THEN 0 ELSE 1 END,
-          length(w.word), w.word
+        ORDER BY length(w.word), w.word
         LIMIT 30
       ''', [q]);
     } else {
+      // UZ->EN: tarjima ichidan qidiruv
       rows = await _db!.rawQuery('''
-        SELECT MIN(w.id) as id, w.word, w.word_cyrillic,
+        SELECT w.id, w.word, w.word_cyrillic,
                w.part_of_speech, w.pronunciation,
-               MIN(CASE
-                 WHEN d2.target_language='en'
-                   AND d2.definition NOT LIKE 'Cyrillic%'
-                   AND d2.definition NOT LIKE 'Synonym%'
-                 THEN d2.definition END) as def_en,
-               MIN(CASE WHEN d2.target_language='ru'
-                   THEN d2.definition END) as def_ru
+               d.definition as def_en
         FROM definitions d
         JOIN words w ON w.id = d.word_id
-        LEFT JOIN definitions d2 ON d2.word_id = w.id AND d2.definition != ''
-        WHERE d.target_language = 'en' AND d.definition LIKE ?
-          AND d.definition NOT LIKE 'Cyrillic%'
-          AND d.definition NOT LIKE 'Synonym%'
-        GROUP BY w.word, w.part_of_speech
+        WHERE d.definition LIKE ?
         ORDER BY length(w.word), w.word
         LIMIT 30
       ''', [q]);
     }
 
-    // Dart da ham filterlash
-    final entries = rows.map(_rowToEntry).toList();
-    return entries.where((e) => _isGoodEntry(e)).toList();
+    return rows.map(_rowToEntry).where((e) => e.word.isNotEmpty).toList();
   }
 
-  bool _isGoodEntry(DictionaryEntry e) {
-    if (e.word.isEmpty) return false;
-    return true;
-  }
-
-  /// Tafsilot: so'zning barcha yaxshi ta'riflari
   Future<DictionaryEntry?> getById(int id) async {
     if (_db == null) return null;
     final wordRows = await _db!.rawQuery(
         'SELECT * FROM words WHERE id = ?', [id]);
     if (wordRows.isEmpty) return null;
 
-    final word = (wordRows.first['word'] as String).trim();
-
     final defRows = await _db!.rawQuery('''
-      SELECT DISTINCT d.definition, d.target_language,
-             d.example_source, d.example_target
-      FROM definitions d
-      JOIN words w ON w.id = d.word_id
-      WHERE w.word = ?
-        AND d.definition != ''
-        AND d.definition NOT LIKE 'Cyrillic%'
-        AND d.definition NOT LIKE 'Synonym%'
-        AND d.definition NOT LIKE 'Alternative%'
-        AND d.definition NOT LIKE 'plural of%'
-      ORDER BY
-        CASE WHEN d.target_language='en' THEN 0 ELSE 1 END,
-        length(d.definition)
-    ''', [word]);
+      SELECT definition, target_language, example_source, example_target
+      FROM definitions
+      WHERE word_id = ? AND definition != ''
+    ''', [id]);
 
-    final seenEn = <String>{};
-    final seenRu = <String>{};
     final defList = <Definition>[];
-
     for (final d in defRows) {
-      final text  = (d['definition'] as String).trim();
-      final lang  = d['target_language'] as String;
-      final exSrc = (d['example_source'] as String? ?? '').trim();
-      final exTgt = (d['example_target'] as String? ?? '').trim();
-
-      // Yomon ta'riflarni o'tkazib yuborish
-      bool isBad = _badPrefixes.any(
-          (p) => text.toLowerCase().startsWith(p.toLowerCase()));
-      if (isBad) continue;
-
-      if (lang == 'en' && seenEn.add(text)) {
-        defList.add(Definition(text: text, language: 'en',
-            exampleSource: exSrc, exampleTarget: exTgt));
-      } else if (lang == 'ru' && seenRu.add(text)) {
-        defList.add(Definition(text: text, language: 'ru',
-            exampleSource: exSrc, exampleTarget: exTgt));
-      }
+      final text = (d['definition'] as String).trim();
+      if (text.isEmpty) continue;
+      defList.add(Definition(
+        text: text,
+        language: 'uz',
+        exampleSource: (d['example_source'] as String? ?? '').trim(),
+        exampleTarget: (d['example_target'] as String? ?? '').trim(),
+      ));
     }
 
     final row = wordRows.first;
     return DictionaryEntry(
       id: id,
-      word: word,
+      word: (row['word'] as String).trim(),
       wordCyrillic: (row['word_cyrillic'] as String? ?? '').trim(),
       partOfSpeech: (row['part_of_speech'] as String? ?? '').trim(),
       pronunciation: (row['pronunciation'] as String? ?? '').trim(),
@@ -179,9 +132,7 @@ class DictionaryService {
   }
 
   DictionaryEntry _rowToEntry(Map<String, dynamic> row) {
-    final defEn = (row['def_en'] as String? ?? '').trim();
-    final defRu = (row['def_ru'] as String? ?? '').trim();
-
+    final defText = (row['def_en'] as String? ?? '').trim();
     return DictionaryEntry(
       id: row['id'] as int,
       word: (row['word'] as String).trim(),
@@ -189,10 +140,8 @@ class DictionaryService {
       partOfSpeech: (row['part_of_speech'] as String? ?? '').trim(),
       pronunciation: (row['pronunciation'] as String? ?? '').trim(),
       definitions: [
-        if (defEn.isNotEmpty)
-          Definition(text: defEn, language: 'en'),
-        if (defRu.isNotEmpty)
-          Definition(text: defRu, language: 'ru'),
+        if (defText.isNotEmpty)
+          Definition(text: defText, language: 'uz'),
       ],
     );
   }
